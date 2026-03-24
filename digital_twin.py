@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 load_dotenv()
 
@@ -288,58 +289,28 @@ def recommend_actions(profile: dict) -> list[str]:
     return recs
 
 
-# ═══════════════════════════════════════════════════════════
-# LLM  (Ollama — Llama 3, local)
-# ═══════════════════════════════════════════════════════════
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "llama3")
-
+# ─────────────────────────────────────────────
+# LLM (Gemini API)
+# ─────────────────────────────────────────────
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 def call_llm(prompt: str, system: str = "") -> str:
     """
-    Calls a local Ollama Llama 3 model.
-
-    Requires Ollama to be running:
-        ollama serve
-    Model must be pulled:
-        ollama pull llama3
-
-    Override defaults via .env:
-        OLLAMA_MODEL=llama3:8b
-        OLLAMA_BASE_URL=http://localhost:11434
+    Calls Google Gemini model using API key from .env
     """
-    full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
 
     try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={
-                "model":  OLLAMA_MODEL,
-                "prompt": full_prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.7,
-                    "num_predict": 600,
-                },
-            },
-            timeout=300,
-        )
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
-    except requests.exceptions.ConnectionError:
-        return (
-            "[ERROR] Ollama is not running.\n"
-            "Fix: open a terminal and run:  ollama serve"
-        )
-    except requests.exceptions.Timeout:
-        return (
-            "[ERROR] Ollama timed out.\n"
-            "Fix: add  OLLAMA_MODEL=llama3:8b  to your .env file for a faster model."
-        )
+        full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
+
+        response = model.generate_content(full_prompt)
+
+        return response.text.strip()
+
     except Exception as exc:
-        return f"[ERROR] Ollama: {exc}"
-
+        return f"[ERROR] Gemini API: {exc}"
+    
 
 # ═══════════════════════════════════════════════════════════
 # LLM CAPABILITY 1 — Weakness Diagnosis

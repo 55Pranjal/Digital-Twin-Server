@@ -1,0 +1,87 @@
+{
+  "weakness_diagnosis": {
+    "mean_precision": 0.5833,
+    "mean_recall": 1.0,
+    "mean_f1": 0.5833,
+    "n_students": 60
+  },
+  "explanation_quality": {
+    "avg_llm_rating": 3.0,
+    "max_rating": 5,
+    "n_evaluated": 5,
+    "details": [
+      {
+        "student_id": 18,
+        "concept": "probability",
+        "rating": 3
+      },
+      {
+        "student_id": 16,
+        "concept": "databases",
+        "rating": 3
+      },
+      {
+        "student_id": 15,
+        "concept": "databases",
+        "rating": 3
+      },
+      {
+        "student_id": 9,
+        "concept": "databases",
+        "rating": 3
+      },
+      {
+        "student_id": 48,
+        "concept": "probability",
+        "rating": 3
+      }
+    ]
+  },
+  "performance_prediction": {
+    "accuracy": 0.5333,
+    "weighted_f1": 0.4576,
+    "baseline_f1": 0.315,
+    "classification_report": {
+      "High": {
+        "precision": 0.24324324324324326,
+        "recall": 1.0,
+        "f1-score": 0.391304347826087,
+        "support": 9.0
+      },
+      "Medium": {
+        "precision": 1.0,
+        "recall": 0.034482758620689655,
+        "f1-score": 0.06666666666666667,
+        "support": 29.0
+      },
+      "Low": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 22.0
+      },
+      "accuracy": 0.5333333333333333,
+      "macro avg": {
+        "precision": 0.7477477477477477,
+        "recall": 0.6781609195402298,
+        "f1-score": 0.4859903381642512,
+        "support": 60.0
+      },
+      "weighted avg": {
+        "precision": 0.8864864864864865,
+        "recall": 0.5333333333333333,
+        "f1-score": 0.45758454106280194,
+        "support": 60.0
+      }
+    },
+    "n_students": 60
+  },
+  "exam_simulation": {
+    "avg_kw_overlap": 0.0167,
+    "weak_student_overlap": 0.0,
+    "strong_student_overlap": 0.0185,
+    "gap_weak_vs_strong": 0.0185,
+    "n_evaluated": 10,
+    "note": "Higher gap = twin correctly differentiates weak vs strong students"
+  }
+}
