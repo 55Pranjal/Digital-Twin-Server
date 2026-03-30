@@ -3,22 +3,32 @@ main.py
 -------
 EduTwin FastAPI server.
 
-Run with:
+Run locally:
     uvicorn main:app --reload --port 8000
 
-All 12 endpoints from edutwin_api_contract.json are implemented here.
+Production:
+    uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+
+Environment variables
+---------------------
+ALLOWED_ORIGINS   Comma-separated list of allowed CORS origins.
+                  Defaults to localhost dev ports when unset.
+                  Example: https://app.edutwin.com,https://www.edutwin.com
 """
 
 from __future__ import annotations
 
+import logging
+import os
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
-import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from digital_twin import (
+    COURSE_TOPICS,
     INTERVENTION_EFFECTS,
     build_profile,
     check_goal,
@@ -42,6 +52,65 @@ from evaluate import run_full_evaluation
 
 
 # ═══════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("edutwin")
+
+
+# ═══════════════════════════════════════════════════════════
+# CORS ORIGINS  (read from environment in production)
+# ═══════════════════════════════════════════════════════════
+
+def _get_allowed_origins() -> list[str]:
+    """
+    In production set ALLOWED_ORIGINS to a comma-separated list:
+        ALLOWED_ORIGINS=https://app.edutwin.com,https://www.edutwin.com
+
+    Leaving the variable unset falls back to localhost dev ports only.
+    Never include "*" when allow_credentials=True — browsers reject it.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    if raw.strip():
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+        logger.info("CORS origins loaded from environment: %s", origins)
+        return origins
+
+    # Development fallback — safe defaults only
+    dev_origins = [
+        "http://localhost:5173",   # Vite default
+        "http://localhost:3000",   # CRA / Next.js default
+        "http://localhost:4173",   # Vite preview
+    ]
+    logger.warning(
+        "ALLOWED_ORIGINS not set — using dev-only CORS origins %s. "
+        "Set ALLOWED_ORIGINS in production.",
+        dev_origins,
+    )
+    return dev_origins
+
+
+# ═══════════════════════════════════════════════════════════
+# LIFESPAN  (replaces deprecated @app.on_event)
+# ═══════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load dataset + memory once when the server starts."""
+    logger.info("EduTwin starting up — loading memory and dataset …")
+    load_memory()
+    load_dataset()
+    logger.info("Startup complete.")
+    yield
+    logger.info("EduTwin shutting down.")
+
+
+# ═══════════════════════════════════════════════════════════
 # APP SETUP
 # ═══════════════════════════════════════════════════════════
 
@@ -49,31 +118,16 @@ app = FastAPI(
     title="EduTwin API",
     description="LLM-Powered Digital Twin of University Students",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
-# ── CORS ─────────────────────────────────────────────────────────────
-# Allow the Vite dev server and any localhost port.
-# In production, replace "*" with your actual frontend domain.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # Vite default
-        "http://localhost:3000",   # CRA / Next.js default
-        "http://localhost:4173",   # Vite preview
-        "*",                       # remove in production
-    ],
+    allow_origins=_get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ── Startup ───────────────────────────────────────────────────────────
-@app.on_event("startup")
-def on_startup():
-    """Load dataset + memory once when server starts."""
-    load_memory()
-    load_dataset()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -98,17 +152,6 @@ class EvaluateBody(BaseModel):
 # HELPERS
 # ═══════════════════════════════════════════════════════════
 
-def _safe_float(val) -> float:
-    """Convert numpy floats / NaN to plain Python float."""
-    if val is None:
-        return None
-    try:
-        f = float(val)
-        return None if (f != f) else f   # NaN check
-    except Exception:
-        return None
-
-
 def _get_profile_or_404(student_id: int, force_rebuild: bool = False) -> dict:
     """Build profile or raise 404 if student not found."""
     try:
@@ -116,6 +159,7 @@ def _get_profile_or_404(student_id: int, force_rebuild: bool = False) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
+        logger.exception("Unexpected error building profile for student %d", student_id)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -444,8 +488,6 @@ def get_recommendations(student_id: int):
 # GET /api/v1/teacher
 # ═══════════════════════════════════════════════════════════
 
-from digital_twin import COURSE_TOPICS
-
 @app.get("/api/v1/teacher")
 def teacher_overview(
     num_students: Optional[int] = Query(default=None, ge=1, le=60),
@@ -465,33 +507,33 @@ def teacher_overview(
         try:
             profiles.append(build_profile(sid, force_rebuild=False))
         except Exception:
+            logger.warning("Could not build profile for student %d — skipping.", sid)
             continue
 
     if not profiles:
         raise HTTPException(status_code=500, detail="Could not load any student profiles.")
 
-    perfs      = [compute_performance(p) for p in profiles]
-    risk_data  = [predict_struggle(p) for p in profiles]
-    risk_labels = [r["risk"] for r in risk_data]
+    # Compute per-profile values once to avoid redundant calls
+    perf_list      = [compute_performance(p) for p in profiles]
+    risk_list      = [predict_struggle(p) for p in profiles]   # called once per profile
+    risk_labels    = [r["risk"] for r in risk_list]
 
-    # Per-student rows sorted by risk score descending
     students_out = sorted(
         [
             {
                 "student_id":    p["student_id"],
                 "name":          p["name"],
-                "avg_score_pct": round(compute_performance(p) * 100, 1),
-                "risk":          predict_struggle(p)["risk"],
-                "risk_score":    predict_struggle(p)["score"],
+                "avg_score_pct": round(perf * 100, 1),
+                "risk":          risk["risk"],
+                "risk_score":    risk["score"],
                 "weak_topics":   p["weak_topics"],
             }
-            for p in profiles
+            for p, perf, risk in zip(profiles, perf_list, risk_list)
         ],
         key=lambda x: x["risk_score"],
         reverse=True,
     )
 
-    # Topic averages
     topic_averages = {
         t: round(
             float(sum(p["knowledge"].get(t, 0) for p in profiles) / len(profiles)) * 100, 1
@@ -502,7 +544,7 @@ def teacher_overview(
     return {
         "class_summary": {
             "total_students":    len(profiles),
-            "class_avg_pct":     round(float(sum(perfs) / len(perfs)) * 100, 1),
+            "class_avg_pct":     round(float(sum(perf_list) / len(perf_list)) * 100, 1),
             "high_risk_count":   risk_labels.count("High Risk"),
             "medium_risk_count": risk_labels.count("Medium Risk"),
             "low_risk_count":    risk_labels.count("Low Risk"),
@@ -527,6 +569,7 @@ def evaluation_pipeline(body: EvaluateBody):
     try:
         results = run_full_evaluation(student_ids=body.student_ids)
     except Exception as exc:
+        logger.exception("Evaluation pipeline failed")
         raise HTTPException(status_code=500, detail=str(exc))
 
     # Sanitise numpy floats / NaN values for JSON serialisation
@@ -548,6 +591,16 @@ def evaluation_pipeline(body: EvaluateBody):
 # HEALTH CHECK
 # ═══════════════════════════════════════════════════════════
 
+@app.get("/health")
 @app.get("/")
 def health_check():
     return {"status": "ok", "service": "EduTwin API", "version": "1.0.0"}
+
+
+# ═══════════════════════════════════════════════════════════
+# LOCAL ENTRY POINT
+# ═══════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
