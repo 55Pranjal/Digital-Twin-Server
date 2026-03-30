@@ -6,6 +6,8 @@ python-dotenv>=1.0
 faker>=24.0
 scikit-learn>=1.4
 google-generativeai
+fastapi>=0.110
+uvicorn>=0.29
 # Optional (RAG retrieval)
 # faiss-cpu>=1.8
 # sentence-transformers>=2.7
