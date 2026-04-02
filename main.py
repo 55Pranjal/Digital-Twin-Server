@@ -217,8 +217,6 @@ def get_profile(
     Cached unless force_rebuild=true.
     """
     profile = _get_profile_or_404(student_id, force_rebuild=force_rebuild)
-    update_memory(student_id, profile)
-    save_memory()
     return profile
 
 
@@ -341,7 +339,7 @@ def _keyword_overlap(answer: str, topic: str) -> float:
         return 0.5
     answer_lower = answer.lower()
     hits = sum(1 for kw in keywords if kw in answer_lower)
-    return round(hits / len(keywords), 4)
+    return round(hits / len(keywords), 4)  # type: ignore[arg-type]
 
 
 @app.post("/api/v1/exam/{student_id}")
@@ -539,7 +537,7 @@ def teacher_overview(
     all_ids = sorted(df["student_id"].unique().tolist())
 
     if num_students is not None:
-        all_ids = all_ids[:num_students]
+        all_ids = all_ids[:num_students]  # type: ignore[arg-type]
 
     profiles = []
     for sid in all_ids:
@@ -575,7 +573,7 @@ def teacher_overview(
 
     topic_averages = {
         t: round(
-            float(sum(p["knowledge"].get(t, 0) for p in profiles) / len(profiles)) * 100, 1
+            float(sum(p["knowledge"].get(t, 0) for p in profiles) / len(profiles)) * 100, 1  # type: ignore[arg-type]
         )
         for t in COURSE_TOPICS
     }
@@ -583,7 +581,7 @@ def teacher_overview(
     return {
         "class_summary": {
             "total_students":    len(profiles),
-            "class_avg_pct":     round(float(sum(perf_list) / len(perf_list)) * 100, 1),
+            "class_avg_pct":     round(float(sum(perf_list) / len(perf_list)) * 100, 1),  # type: ignore[arg-type]
             "high_risk_count":   risk_labels.count("High Risk"),
             "medium_risk_count": risk_labels.count("Medium Risk"),
             "low_risk_count":    risk_labels.count("Low Risk"),

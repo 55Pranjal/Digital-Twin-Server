@@ -23,6 +23,7 @@ import json
 import os
 import time
 import warnings
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -180,8 +181,9 @@ def delete_student(student_id: int | str) -> bool:
     _df.to_csv(CSV_FILE, index=False)
 
     str_sid = str(student_id)
-    if str_sid in student_memory:
-        student_memory.pop(str_sid, None)
+    with memory_lock:
+        if str_sid in student_memory:
+            student_memory.pop(str_sid, None)
     save_memory()
     return True
 
@@ -235,8 +237,9 @@ def update_student(student_id: int | str, updates: dict) -> dict:
 
     # Invalidate cached profile so next call rebuilds from fresh CSV data
     str_sid = str(student_id)
-    if str_sid in student_memory:
-        student_memory[str_sid] = []
+    with memory_lock:
+        if str_sid in student_memory:
+            student_memory[str_sid] = []
 
     profile = build_profile(sid, force_rebuild=True)
     update_memory(sid, profile)
@@ -247,30 +250,38 @@ def update_student(student_id: int | str, updates: dict) -> dict:
 # ═══════════════════════════════════════════════════════════
 # MEMORY
 # ═══════════════════════════════════════════════════════════
+memory_lock = threading.Lock()
+
 def load_memory() -> None:
     global student_memory
-    try:
-        with open(MEMORY_FILE, "r") as f:
-            student_memory = json.load(f)
-    except FileNotFoundError:
-        student_memory = {}
-    except Exception as exc:
-        warnings.warn(f"Could not load memory: {exc}")
-        student_memory = {}
+    with memory_lock:
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                student_memory = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            warnings.warn(f"Could not load memory: {exc}")
+            student_memory = {}
+        except Exception as exc:
+            warnings.warn(f"Could not load memory: {exc}")
+            student_memory = {}
 
 
 def save_memory() -> None:
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(student_memory, f, indent=2)
+    with memory_lock:
+        tmp_file = MEMORY_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(dict(student_memory), f, indent=2)
+        os.replace(tmp_file, MEMORY_FILE)
 
 
 def update_memory(student_id: int | str, profile: dict) -> None:
     sid = str(student_id)
-    if sid not in student_memory:
-        student_memory[sid] = []
-    copy = json.loads(json.dumps(profile))
-    copy["timestamp"] = time.time()
-    student_memory[sid].append(copy)
+    with memory_lock:
+        if sid not in student_memory:
+            student_memory[sid] = []
+        copy_prof = json.loads(json.dumps(profile))
+        copy_prof["timestamp"] = time.time()
+        student_memory[sid].append(copy_prof)
 
 
 # ═══════════════════════════════════════════════════════════
