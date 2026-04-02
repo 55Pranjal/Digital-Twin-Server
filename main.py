@@ -30,12 +30,15 @@ from pydantic import BaseModel
 from digital_twin import (
     COURSE_TOPICS,
     INTERVENTION_EFFECTS,
+    add_student,
     build_profile,
     check_goal,
     compute_performance,
+    delete_student,
     diagnose_weaknesses_with_llm,
     generate_personalized_explanation,
     generate_study_plan,
+    list_students,
     load_dataset,
     load_memory,
     predict_performance_llm,
@@ -47,6 +50,7 @@ from digital_twin import (
     simulate_intervention,
     update_from_real_outcome,
     update_memory,
+    update_student,
 )
 from evaluate import run_full_evaluation
 
@@ -146,6 +150,41 @@ class FeedbackBody(BaseModel):
 
 class EvaluateBody(BaseModel):
     student_ids: Optional[List[int]] = None
+
+
+# ── Student CRUD models ──────────────────────────────────────
+
+class TopicInput(BaseModel):
+    topic: str
+    score: float = 0.50
+    time_spent: float = 60.0
+    attempts: float = 2.0
+    confidence: float = 0.50
+    engagement: float = 0.50
+    fatigue: float = 0.30
+
+class AddStudentBody(BaseModel):
+    name: str
+    year: int = 1
+    branch: str = "CSE"
+    archetype: str = "unknown"
+    topics: List[TopicInput] = []
+
+class TopicUpdate(BaseModel):
+    topic: str
+    score: Optional[float] = None
+    time_spent: Optional[float] = None
+    attempts: Optional[float] = None
+    confidence: Optional[float] = None
+    engagement: Optional[float] = None
+    fatigue: Optional[float] = None
+
+class UpdateStudentBody(BaseModel):
+    name: Optional[str] = None
+    year: Optional[int] = None
+    branch: Optional[str] = None
+    archetype: Optional[str] = None
+    topics: Optional[List[TopicUpdate]] = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -585,6 +624,132 @@ def evaluation_pipeline(body: EvaluateBody):
         return obj
 
     return sanitise(results)
+
+
+# ═══════════════════════════════════════════════════════════
+# ENDPOINT 13 — LIST ALL STUDENTS
+# GET /api/v1/students
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/v1/students")
+def get_all_students():
+    """
+    Returns a lightweight list of every student in the dataset
+    (student_id, name, year, branch, archetype). Useful for populating
+    dashboards and dropdown menus without building full profiles.
+    """
+    try:
+        students = list_students()
+    except Exception as exc:
+        logger.exception("Failed to list students")
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"total": len(students), "students": students}
+
+
+# ═══════════════════════════════════════════════════════════
+# ENDPOINT 14 — ADD STUDENT
+# POST /api/v1/students
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/api/v1/students", status_code=201)
+def create_student(body: AddStudentBody):
+    """
+    Adds a new student to the dataset and returns their freshly built profile.
+
+    - A unique student_id is assigned automatically (max existing id + 1).
+    - You may supply per-topic values inside `topics`; any topic omitted
+      from the list is created with neutral defaults (score=0.5, etc.).
+    - All eight course topics are always created so the profile is complete.
+    """
+    student_data = body.model_dump()
+    try:
+        profile = add_student(student_data)
+    except Exception as exc:
+        logger.exception("Failed to add student")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "message":    "Student created successfully.",
+        "student_id": profile["student_id"],
+        "profile":    profile,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# ENDPOINT 15 — UPDATE STUDENT
+# PUT /api/v1/students/{student_id}
+# ═══════════════════════════════════════════════════════════
+
+@app.put("/api/v1/students/{student_id}")
+def modify_student(student_id: int, body: UpdateStudentBody):
+    """
+    Partially updates a student's metadata and/or per-topic scores.
+
+    Only fields present in the request body are changed; everything else
+    is left untouched. Returns the rebuilt profile after saving.
+
+    Example — update name and two topic scores:
+    ```json
+    {
+      "name": "Alice Updated",
+      "topics": [
+        {"topic": "ai_ml", "score": 0.82},
+        {"topic": "probability", "confidence": 0.65}
+      ]
+    }
+    ```
+    """
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+
+    # Convert TopicUpdate objects to plain dicts, dropping None fields
+    if "topics" in updates:
+        updates["topics"] = [
+            {k: v for k, v in t.items() if v is not None}
+            for t in updates["topics"]
+        ]
+
+    try:
+        profile = update_student(student_id, updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Failed to update student %d", student_id)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "message":    "Student updated successfully.",
+        "student_id": str(student_id),
+        "profile":    profile,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# ENDPOINT 16 — DELETE STUDENT
+# DELETE /api/v1/students/{student_id}
+# ═══════════════════════════════════════════════════════════
+
+@app.delete("/api/v1/students/{student_id}", status_code=200)
+def remove_student(student_id: int):
+    """
+    Permanently removes a student from the CSV dataset and clears their
+    memory history. Returns 404 if the student does not exist.
+    """
+    try:
+        found = delete_student(student_id)
+    except Exception as exc:
+        logger.exception("Failed to delete student %d", student_id)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Student ID {student_id} not found.",
+        )
+
+    return {
+        "message":    f"Student {student_id} deleted successfully.",
+        "student_id": str(student_id),
+    }
 
 
 # ═══════════════════════════════════════════════════════════
