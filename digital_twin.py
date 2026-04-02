@@ -26,14 +26,14 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import requests
-from dotenv import load_dotenv
-import google.generativeai as genai
+import matplotlib.pyplot as plt  # type: ignore[import-untyped]
+import numpy as np  # type: ignore[import-untyped]
+import pandas as pd  # type: ignore[import-untyped]
+from dotenv import load_dotenv  # type: ignore[import-untyped]
+import google.generativeai as genai  # type: ignore[import-untyped]
 
-load_dotenv()
+env_path = Path(r"C:\College\Digital Twin(Server side)\.env")
+load_dotenv(dotenv_path=env_path)
 
 # ─────────────────────────────────────────────
 # CONSTANTS
@@ -73,7 +73,7 @@ TOPIC_DIFFICULTY = {"ai_ml": 0.5, "probability": 0.7, "linear_algebra": 0.8}
 # GLOBAL STATE
 # ─────────────────────────────────────────────
 _df: pd.DataFrame | None = None
-student_memory: dict[str, list] = {}
+student_memory: dict[str, list[Any]] = {}
 
 _rag_index = None
 _rag_docs: list[str] = []
@@ -92,6 +92,156 @@ def load_dataset() -> pd.DataFrame:
             )
         _df = pd.read_csv(CSV_FILE)
     return _df
+
+
+# ═══════════════════════════════════════════════════════════
+# STUDENT CRUD
+# ═══════════════════════════════════════════════════════════
+
+def list_students() -> list[dict]:
+    """Return a lightweight list of all students (id, name, year, branch, archetype)."""
+    df = load_dataset()
+    meta_cols = ["student_id", "name", "year", "branch", "archetype"]
+    available = [c for c in meta_cols if c in df.columns]
+    return (
+        df[available]
+        .drop_duplicates(subset=["student_id"])
+        .sort_values("student_id")
+        .to_dict(orient="records")
+    )
+
+
+def add_student(student_data: dict) -> dict:
+    """
+    Add a new student to the CSV dataset.
+
+    Expected keys in student_data
+    ──────────────────────────────
+    name       str         (required)
+    year       int         (default 1)
+    branch     str         (default "CSE")
+    archetype  str         (default "unknown")
+    topics     list[dict]  each dict may contain:
+                 topic, score, time_spent, attempts,
+                 confidence, engagement, fatigue
+                 Missing topic entries are auto-filled with neutral defaults.
+
+    Returns the freshly built profile dict for the new student.
+    """
+    global _df
+    df = load_dataset()
+
+    # Auto-assign next available student_id
+    new_id = int(df["student_id"].max()) + 1 if not df.empty else 1
+
+    topic_map = {t["topic"]: t for t in student_data.get("topics", []) if "topic" in t}
+
+    rows: list[dict] = []
+    for topic in COURSE_TOPICS:
+        td = topic_map.get(topic, {})
+        rows.append({
+            "student_id":  new_id,
+            "name":        student_data.get("name", f"Student {new_id}"),
+            "year":        int(student_data.get("year", 1)),
+            "branch":      student_data.get("branch", "CSE"),
+            "archetype":   student_data.get("archetype", "unknown"),
+            "topic":       topic,
+            "score":       float(td.get("score",       0.50)),
+            "time_spent":  float(td.get("time_spent",  60.0)),
+            "attempts":    float(td.get("attempts",    2.0)),
+            "confidence":  float(td.get("confidence",  0.50)),
+            "engagement":  float(td.get("engagement",  0.50)),
+            "fatigue":     float(td.get("fatigue",     0.30)),
+        })
+
+    _df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+    _df.to_csv(CSV_FILE, index=False)
+
+    profile = build_profile(new_id, force_rebuild=True)
+    update_memory(new_id, profile)
+    save_memory()
+    return profile
+
+
+def delete_student(student_id: int | str) -> bool:
+    """
+    Remove a student from the CSV and from in-memory history.
+
+    Returns True if the student was found and deleted, False if not found.
+    """
+    global _df
+    df  = load_dataset()
+    sid = int(student_id)
+
+    if sid not in df["student_id"].values:
+        return False
+
+    _df = df[df["student_id"] != sid].reset_index(drop=True)
+    _df.to_csv(CSV_FILE, index=False)
+
+    str_sid = str(student_id)
+    if str_sid in student_memory:
+        student_memory.pop(str_sid, None)
+    save_memory()
+    return True
+
+
+def update_student(student_id: int | str, updates: dict) -> dict:
+    """
+    Partially update a student's metadata and/or per-topic values.
+
+    Accepted keys in updates
+    ────────────────────────
+    name, year, branch, archetype   — metadata fields
+    topics  list[dict]              — each dict: {topic, score?, time_spent?,
+                                      attempts?, confidence?, engagement?, fatigue?}
+                                      Only supplied fields are overwritten.
+
+    Returns the rebuilt profile dict after saving.
+    Raises ValueError if the student does not exist.
+    """
+    global _df
+    load_dataset()              # ensures _df is populated
+    assert _df is not None, "Dataset failed to load"
+    df: pd.DataFrame = _df          # local non-None reference for type checker
+    sid = int(student_id)
+
+    if sid not in df["student_id"].values:  # type: ignore[index]
+        raise ValueError(f"Student ID {sid} not found in dataset.")
+
+    base_mask = df["student_id"] == sid  # type: ignore[index]
+
+    # ── metadata fields ──────────────────────────────────────
+    for field in ("name", "year", "branch", "archetype"):
+        if field in updates:
+            df.loc[base_mask, field] = updates[field]  # type: ignore[index]
+
+    # ── per-topic fields ─────────────────────────────────────
+    numeric_fields = ("score", "time_spent", "attempts", "confidence", "engagement", "fatigue")
+    for topic_upd in updates.get("topics", []):
+        topic = topic_upd.get("topic")
+        if not topic:
+            continue
+        topic_mask = base_mask & (df["topic"] == topic)  # type: ignore[index]
+        if not topic_mask.any():
+            warnings.warn(f"Topic '{topic}' not found for student {sid}; skipping.")
+            continue
+        for field in numeric_fields:
+            if field in topic_upd:
+                df.loc[topic_mask, field] = float(topic_upd[field])  # type: ignore[index]
+
+    _df = df
+    _df.to_csv(CSV_FILE, index=False)
+
+    # Invalidate cached profile so next call rebuilds from fresh CSV data
+    str_sid = str(student_id)
+    if str_sid in student_memory:
+        student_memory[str_sid] = []
+
+    profile = build_profile(sid, force_rebuild=True)
+    update_memory(sid, profile)
+    save_memory()
+    return profile
 
 
 # ═══════════════════════════════════════════════════════════
@@ -127,7 +277,7 @@ def update_memory(student_id: int | str, profile: dict) -> None:
 # UTILITIES
 # ═══════════════════════════════════════════════════════════
 def _clean(x: float) -> float:
-    return float(round(x, 4))
+    return float(round(x, 4))  # type: ignore[arg-type]
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
@@ -218,7 +368,7 @@ def generate_llp_summary(profile: dict) -> str:
 
     return (
         f"{profile['name']} is a Year-{profile['year']} {profile['branch']} student "
-        f"with an overall average of {round(perf * 100, 1)}%. "
+        f"with an overall average of {round(perf * 100, 1)}%. "  # type: ignore[arg-type]
         f"Strong in: {', '.join(strong) if strong else 'none yet'}. "
         f"Weak in: {', '.join(weak) if weak else 'none'}. "
         f"Confidence: {psych.get('confidence_level', 'unknown')}, "
@@ -236,7 +386,7 @@ def compute_performance(profile: dict) -> float:
     knowledge = profile.get("knowledge", {})
     if not knowledge:
         return 0.0
-    return round(sum(knowledge.values()) / len(knowledge), 4)
+    return round(sum(knowledge.values()) / len(knowledge), 4)  # type: ignore[arg-type]
 
 
 def check_goal(profile: dict) -> bool:
@@ -259,7 +409,7 @@ def predict_struggle(profile: dict) -> dict:
     else:
         risk = "Low Risk"
 
-    return {"risk": risk, "score": round(score, 4)}
+    return {"risk": risk, "score": round(score, 4)}  # type: ignore[arg-type]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -292,7 +442,7 @@ def recommend_actions(profile: dict) -> list[str]:
 # ─────────────────────────────────────────────
 # LLM (Gemini API)
 # ─────────────────────────────────────────────
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+genai.configure(api_key=os.getenv("GEMINI_API_KEY") or "")
 
 def call_llm(prompt: str, system: str = "") -> str:
     """
@@ -300,7 +450,7 @@ def call_llm(prompt: str, system: str = "") -> str:
     """
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
 
         full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
 
@@ -352,7 +502,7 @@ def generate_personalized_explanation(profile: dict, concept: str) -> str:
     prompt = (
         f"Student profile:\n"
         f"  Name: {profile['name']} | Year {profile['year']} {profile['branch']}\n"
-        f"  Overall avg: {round(compute_performance(profile) * 100, 1)}%\n"
+        f"  Overall avg: {round(compute_performance(profile) * 100, 1)}%\n"  # type: ignore[arg-type]
         f"  Weak topics: {', '.join(profile['weak_topics']) or 'none'}\n"
         f"  Strong topics: {', '.join(profile.get('strong_topics', [])) or 'none'}\n"
         f"  Confidence: {profile['psychology']['confidence_level']}\n"
@@ -464,7 +614,8 @@ def run_multiple_simulations(profile: dict) -> dict[str, float]:
 
 
 def best_intervention(profile: dict) -> str:
-    return max(run_multiple_simulations(profile), key=lambda k: run_multiple_simulations(profile)[k])
+    sims = run_multiple_simulations(profile)
+    return max(sims, key=lambda k: sims[k])
 
 
 # ═══════════════════════════════════════════════════════════
@@ -486,8 +637,8 @@ def _init_rag() -> bool:
     if _rag_index is not None:
         return True
     try:
-        import faiss
-        from sentence_transformers import SentenceTransformer
+        import faiss  # type: ignore[import-untyped]
+        from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
 
         _embedder  = SentenceTransformer("all-MiniLM-L6-v2")
         _rag_docs  = list(COURSE_MATERIAL.values())
@@ -502,11 +653,11 @@ def _init_rag() -> bool:
 
 
 def retrieve_relevant_material(query: str, top_k: int = 2) -> str:
-    if not _init_rag():
+    if not _init_rag() or _embedder is None or _rag_index is None:
         return COURSE_MATERIAL.get(query, "")
-    query_vec = _embedder.encode([query], convert_to_numpy=True)
-    query_vec = query_vec / np.linalg.norm(query_vec)
-    _, indices = _rag_index.search(query_vec.astype("float32"), top_k)
+    query_vec = _embedder.encode([query], convert_to_numpy=True)  # type: ignore[union-attr]
+    query_vec = query_vec / np.linalg.norm(query_vec)  # type: ignore[operator]
+    _, indices = _rag_index.search(query_vec.astype("float32"), top_k)  # type: ignore[union-attr]
     return " | ".join(_rag_docs[i] for i in indices[0] if i < len(_rag_docs))
 
 
@@ -520,7 +671,7 @@ def plot_subject_progress(student_id: int | str, save_path: str | None = None) -
         print("  No history yet.")
         return
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    _, ax = plt.subplots(figsize=(10, 5))
     for topic in history[0]["knowledge"]:
         vals = [step["knowledge"].get(topic, 0) for step in history]
         ax.plot(vals, marker="o", label=topic)
@@ -546,10 +697,10 @@ def plot_radar(profile: dict, save_path: str | None = None) -> None:
     N       = len(topics)
     angles  = [n / float(N) * 2 * np.pi for n in range(N)] + [0]
 
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={"projection": "polar"})
+    _, ax = plt.subplots(figsize=(6, 6), subplot_kw={"projection": "polar"})
     ax.plot(angles, scores + [scores[0]], linewidth=1.5)
     ax.fill(angles, scores + [scores[0]], alpha=0.25)
-    ax.set_thetagrids([a * 180 / np.pi for a in angles[:-1]], topics)
+    ax.set_thetagrids([a * 180 / np.pi for a in angles[:-1]], topics)  # type: ignore[arg-type]
     ax.set_ylim(0, 1)
     ax.axhline(TARGET_SCORE, color="red", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_title(f"{profile['name']} — Knowledge Radar", pad=20)
@@ -569,7 +720,7 @@ def plot_radar(profile: dict, save_path: str | None = None) -> None:
 def teacher_overview(num_students: int | None = None) -> None:
     df = load_dataset()
     if num_students is None:
-        num_students = df["student_id"].nunique()
+        num_students = int(df["student_id"].nunique())
 
     print(f"\n{_sep('═')}")
     print("  EDUTWIN — TEACHER OVERVIEW")
@@ -600,7 +751,7 @@ def teacher_overview(num_students: int | None = None) -> None:
         weak  = ", ".join(p["weak_topics"]) or "—"
         print(
             f"  {p['student_id']:<5} {p['name'][:20]:<22} "
-            f"{round(compute_performance(p)*100,1):<7} "
+            f"{round(compute_performance(p)*100,1):<7} "  # type: ignore[arg-type]
             f"{emoji} {risk:<12} {weak}"
         )
 
@@ -644,7 +795,7 @@ def run_student(
         status = "✅ Strong" if score >= TARGET_SCORE else ("⚠️ Weak" if score < WEAK_THRESHOLD else "🔶 Fair")
         print(f"  {topic:<22} {pct:>5}%  {status}")
 
-    print(f"\n📊 Performance : {round(compute_performance(profile) * 100, 1)}%")
+    print(f"\n📊 Performance : {round(compute_performance(profile) * 100, 1)}%")  # type: ignore[arg-type]
     print(f"⚠️  Risk         : {predict_struggle(profile)['risk']}")
 
     print(f"\n💡 RECOMMENDATIONS")
@@ -683,8 +834,8 @@ def run_student(
         bar = "█" * int(perf * 40)
         print(f"  {action:<22} {round(perf*100,1):>5}%  {bar}")
 
-    best = max(sims, key=sims.get)
-    print(f"\n🏆 Best strategy: {best}  →  {round(sims[best]*100,1)}%")
+    best = max(sims, key=lambda k: sims[k])
+    print(f"\n🏆 Best strategy: {best}  →  {round(sims[best]*100,1)}%")  # type: ignore[arg-type]
 
     # Apply best + store
     profile = simulate_intervention(profile, best)
@@ -786,8 +937,8 @@ def main():
         print(f"\n🧪 Intervention simulations for {profile['name']}\n")
         for action, perf in sorted(sims.items(), key=lambda x: -x[1]):
             bar = "█" * int(perf * 40)
-            print(f"  {action:<22} {round(perf*100,1):>5}%  {bar}")
-        print(f"\n🏆 Best: {max(sims, key=sims.get)}")
+            print(f"  {action:<22} {round(perf*100,1):>5}%  {bar}")  # type: ignore[arg-type]
+        print(f"\n🏆 Best: {max(sims, key=lambda k: sims[k])}")
 
     elif args.command == "plan":
         profile = build_profile(args.id, force_rebuild=True)
