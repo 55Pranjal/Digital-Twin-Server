@@ -1,5 +1,5 @@
 # EduTwin 🎓
-**LLM-Powered Digital Twin of University Students — Backend**
+**LLM-Powered Digital Twin for University Students — Backend**
 
 ---
 
