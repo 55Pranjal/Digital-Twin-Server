@@ -302,8 +302,7 @@ def eval_exam_simulation(student_ids: List[int], sample_n: int = 10) -> dict:
 
 def run_full_evaluation(student_ids: List[int] | None = None) -> dict:
     load_memory()
-    df = load_dataset()
-    all_ids = df["student_id"].unique().tolist()
+    all_ids = load_dataset()
 
     if student_ids is None:
         student_ids = all_ids

@@ -9,6 +9,8 @@ google-generativeai
 fastapi>=0.110
 uvicorn>=0.29
 gunicorn
+supabase>=2.9
+pyjwt>=2.9
 # Optional (RAG retrieval)
 # faiss-cpu>=1.8
 # sentence-transformers>=2.7

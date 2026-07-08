@@ -23,10 +23,12 @@ import os
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import auth
+import db
 from digital_twin import (
     COURSE_TOPICS,
     INTERVENTION_EFFECTS,
@@ -187,6 +189,15 @@ class UpdateStudentBody(BaseModel):
     topics: Optional[List[TopicUpdate]] = None
 
 
+# ── Auth models ──────────────────────────────────────────────
+
+class RegisterTeacherBody(BaseModel):
+    invite_code: str
+
+class ClaimStudentBody(BaseModel):
+    student_id: int
+
+
 # ═══════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════
@@ -202,6 +213,24 @@ def _get_profile_or_404(student_id: int, force_rebuild: bool = False) -> dict:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ── Auth dependencies ────────────────────────────────────────
+# Thin FastAPI-dependency wrappers around auth.py's role checks. Declaring
+# `student_id: int` as a plain parameter lets FastAPI resolve it from the
+# same path parameter as the route these are used on.
+
+def require_teacher(
+    user: auth.CurrentUser = Depends(auth.get_current_user),
+) -> auth.CurrentUser:
+    return auth.require_teacher(user)
+
+
+def require_self_or_teacher(
+    student_id: int,
+    user: auth.CurrentUser = Depends(auth.get_current_user),
+) -> auth.CurrentUser:
+    return auth.require_self_or_teacher(user, student_id)
+
+
 # ═══════════════════════════════════════════════════════════
 # ENDPOINT 1 — BUILD PROFILE
 # GET /api/v1/profile/{student_id}
@@ -211,6 +240,7 @@ def _get_profile_or_404(student_id: int, force_rebuild: bool = False) -> dict:
 def get_profile(
     student_id: int,
     force_rebuild: bool = Query(default=False),
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
 ):
     """
     Returns the Live Learner Profile (LLP) for a student.
@@ -226,7 +256,7 @@ def get_profile(
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/api/v1/diagnose/{student_id}")
-def diagnose(student_id: int):
+def diagnose(student_id: int, user: auth.CurrentUser = Depends(require_self_or_teacher)):
     """
     LLM identifies 2-3 critical weak areas with remediation advice.
     """
@@ -251,7 +281,11 @@ VALID_TOPICS = [
 ]
 
 @app.get("/api/v1/explain/{student_id}/{concept}")
-def explain(student_id: int, concept: str):
+def explain(
+    student_id: int,
+    concept: str,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
     """
     Generates a personalised concept explanation tuned to the student's profile.
     """
@@ -282,7 +316,11 @@ def explain(student_id: int, concept: str):
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/api/v1/predict/{student_id}/{topic}")
-def predict(student_id: int, topic: str):
+def predict(
+    student_id: int,
+    topic: str,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
     """
     Predicts High / Medium / Low performance on an upcoming assessment.
     Returns both LLM prediction and rule-based prediction.
@@ -343,7 +381,11 @@ def _keyword_overlap(answer: str, topic: str) -> float:
 
 
 @app.post("/api/v1/exam/{student_id}")
-def exam_simulation(student_id: int, body: ExamBody):
+def exam_simulation(
+    student_id: int,
+    body: ExamBody,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
     """
     Simulates the exam answer a student would write for a given question.
     """
@@ -377,6 +419,7 @@ def exam_simulation(student_id: int, body: ExamBody):
 def study_plan(
     student_id: int,
     days: int = Query(default=7, ge=1, le=30),
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
 ):
     """
     Generates a day-by-day personalised study plan.
@@ -406,7 +449,9 @@ def study_plan(
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/api/v1/simulate/{student_id}")
-def intervention_simulation(student_id: int):
+def intervention_simulation(
+    student_id: int, user: auth.CurrentUser = Depends(require_self_or_teacher)
+):
     """
     Runs all 5 intervention strategies and returns projected performance for each.
     """
@@ -434,7 +479,11 @@ def intervention_simulation(student_id: int):
 VALID_INTERVENTIONS = list(INTERVENTION_EFFECTS.keys())
 
 @app.post("/api/v1/simulate/{student_id}/apply")
-def apply_intervention(student_id: int, body: InterventionBody):
+def apply_intervention(
+    student_id: int,
+    body: InterventionBody,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
     """
     Applies a chosen intervention to the student's profile and persists it.
     """
@@ -470,7 +519,11 @@ def apply_intervention(student_id: int, body: InterventionBody):
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/api/v1/feedback/{student_id}")
-def feedback_loop(student_id: int, body: FeedbackBody):
+def feedback_loop(
+    student_id: int,
+    body: FeedbackBody,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
     """
     Corrects the student's confidence estimate based on a real exam outcome.
     new_confidence = old + 0.2 * (actual - old)
@@ -507,7 +560,9 @@ def feedback_loop(student_id: int, body: FeedbackBody):
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/api/v1/recommend/{student_id}")
-def get_recommendations(student_id: int):
+def get_recommendations(
+    student_id: int, user: auth.CurrentUser = Depends(require_self_or_teacher)
+):
     """
     Returns the rule-based list of actionable recommendations.
     """
@@ -528,13 +583,13 @@ def get_recommendations(student_id: int):
 @app.get("/api/v1/teacher")
 def teacher_overview(
     num_students: Optional[int] = Query(default=None, ge=1, le=60),
+    user: auth.CurrentUser = Depends(require_teacher),
 ):
     """
     Returns class-wide summary: per-student risk levels, avg scores,
     and per-topic class averages. Students sorted by risk score descending.
     """
-    df      = load_dataset()
-    all_ids = sorted(df["student_id"].unique().tolist())
+    all_ids = sorted(load_dataset())
 
     if num_students is not None:
         all_ids = all_ids[:num_students]  # type: ignore[arg-type]
@@ -598,7 +653,9 @@ def teacher_overview(
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/api/v1/evaluate")
-def evaluation_pipeline(body: EvaluateBody):
+def evaluation_pipeline(
+    body: EvaluateBody, user: auth.CurrentUser = Depends(require_teacher)
+):
     """
     Runs the full 4-part evaluation pipeline.
     Long-running — may take several minutes.
@@ -630,11 +687,16 @@ def evaluation_pipeline(body: EvaluateBody):
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/api/v1/students")
-def get_all_students():
+def get_all_students(user: auth.CurrentUser = Depends(auth.get_current_user)):
     """
     Returns a lightweight list of every student in the dataset
     (student_id, name, year, branch, archetype). Useful for populating
     dashboards and dropdown menus without building full profiles.
+
+    Any authenticated user may call this — including someone who has just
+    signed up and hasn't completed profile setup yet (role/student_id may
+    still be None at this point), since the student sign-up flow needs the
+    roster to offer the "pick your name" step.
     """
     try:
         students = list_students()
@@ -650,11 +712,14 @@ def get_all_students():
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/api/v1/students", status_code=201)
-def create_student(body: AddStudentBody):
+def create_student(
+    body: AddStudentBody, user: auth.CurrentUser = Depends(require_teacher)
+):
     """
-    Adds a new student to the dataset and returns their freshly built profile.
+    Adds a new student to the roster and returns their freshly built profile.
+    Teacher-only — students register themselves via /api/v1/auth/register-student.
 
-    - A unique student_id is assigned automatically (max existing id + 1).
+    - A unique student_id is assigned automatically.
     - You may supply per-topic values inside `topics`; any topic omitted
       from the list is created with neutral defaults (score=0.5, etc.).
     - All eight course topics are always created so the profile is complete.
@@ -679,7 +744,11 @@ def create_student(body: AddStudentBody):
 # ═══════════════════════════════════════════════════════════
 
 @app.put("/api/v1/students/{student_id}")
-def modify_student(student_id: int, body: UpdateStudentBody):
+def modify_student(
+    student_id: int,
+    body: UpdateStudentBody,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
     """
     Partially updates a student's metadata and/or per-topic scores.
 
@@ -727,7 +796,9 @@ def modify_student(student_id: int, body: UpdateStudentBody):
 # ═══════════════════════════════════════════════════════════
 
 @app.delete("/api/v1/students/{student_id}", status_code=200)
-def remove_student(student_id: int):
+def remove_student(
+    student_id: int, user: auth.CurrentUser = Depends(require_teacher)
+):
     """
     Permanently removes a student from the CSV dataset and clears their
     memory history. Returns 404 if the student does not exist.
@@ -747,6 +818,99 @@ def remove_student(student_id: int):
     return {
         "message":    f"Student {student_id} deleted successfully.",
         "student_id": str(student_id),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# AUTH — profile completion after Supabase Auth sign-up/sign-in
+# ═══════════════════════════════════════════════════════════
+# The client authenticates directly against Supabase Auth (supabase-js).
+# These endpoints only handle the app-specific step of linking that auth
+# user to a role ("teacher" | "student") and, for students, a student_id.
+
+@app.get("/api/v1/auth/me")
+def get_me(user: auth.CurrentUser = Depends(auth.get_current_user)):
+    """
+    Returns the caller's role and (for students) linked student_id.
+    role is null until register-teacher / register-student / claim-student
+    has been called once for this account.
+    """
+    return {
+        "user_id":    user.user_id,
+        "email":      user.email,
+        "role":       user.role,
+        "student_id": user.student_id,
+    }
+
+
+@app.post("/api/v1/auth/register-teacher")
+def register_teacher(
+    body: RegisterTeacherBody,
+    user: auth.CurrentUser = Depends(auth.get_current_user),
+):
+    """
+    Grants the teacher role to the calling account, gated by a shared
+    invite code (set via the TEACHER_INVITE_CODE environment variable) so
+    that self-serve sign-up can't silently hand out teacher access.
+    """
+    expected = os.getenv("TEACHER_INVITE_CODE", "")
+    if not expected or body.invite_code != expected:
+        raise HTTPException(status_code=403, detail="Invalid teacher invite code.")
+
+    profile = db.create_user_profile(user.user_id, role="teacher")
+    return {"message": "Teacher role granted.", "role": profile["role"]}
+
+
+@app.post("/api/v1/auth/claim-student")
+def claim_student(
+    body: ClaimStudentBody,
+    user: auth.CurrentUser = Depends(auth.get_current_user),
+):
+    """
+    Links the calling account to an existing (unclaimed) student record —
+    the "pick your name from the roster" sign-up path.
+    """
+    meta = db.get_student_meta(body.student_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Student not found.")
+    if meta.get("auth_user_id"):
+        raise HTTPException(
+            status_code=409, detail="This student record is already claimed."
+        )
+
+    db.link_student_to_user(body.student_id, user.user_id)
+    profile = db.create_user_profile(user.user_id, role="student", student_id=body.student_id)
+    return {
+        "message":    "Student account linked.",
+        "role":       profile["role"],
+        "student_id": profile["student_id"],
+    }
+
+
+@app.post("/api/v1/auth/register-student", status_code=201)
+def register_student(
+    body: AddStudentBody,
+    user: auth.CurrentUser = Depends(auth.get_current_user),
+):
+    """
+    Creates a brand-new student record for the calling account in one
+    step — the "I'm new here" sign-up path.
+    """
+    student_data = body.model_dump()
+    try:
+        profile = add_student(student_data)
+    except Exception as exc:
+        logger.exception("Failed to register new student")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    new_id = int(profile["student_id"])
+    db.link_student_to_user(new_id, user.user_id)
+    db.create_user_profile(user.user_id, role="student", student_id=new_id)
+
+    return {
+        "message":    "Student registered successfully.",
+        "student_id": new_id,
+        "profile":    profile,
     }
 
 
