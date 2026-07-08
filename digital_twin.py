@@ -12,7 +12,7 @@ Capabilities:
   6.  Intervention simulation + best-strategy selection
   7.  Study plan generation
   8.  Feedback loop (real-outcome correction)
-  9.  Temporal memory with JSON persistence
+  9.  Temporal memory persisted to Supabase (student_memory table)
   10. RAG retrieval (FAISS + sentence-transformers, optional)
   11. Progress charts (line + radar)
 """
@@ -23,24 +23,22 @@ import json
 import os
 import time
 import warnings
-import threading
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt  # type: ignore[import-untyped]
 import numpy as np  # type: ignore[import-untyped]
-import pandas as pd  # type: ignore[import-untyped]
 from dotenv import load_dotenv  # type: ignore[import-untyped]
 import google.generativeai as genai  # type: ignore[import-untyped]
 
-env_path = Path(r"C:\College\Digital Twin(Server side)\.env")
+import db
+
+env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
-MEMORY_FILE    = "student_memory.json"
-CSV_FILE       = "enhanced_students_dataset.csv"
 TARGET_SCORE   = 0.70
 WEAK_THRESHOLD = 0.50
 
@@ -73,48 +71,31 @@ TOPIC_DIFFICULTY = {"ai_ml": 0.5, "probability": 0.7, "linear_algebra": 0.8}
 # ─────────────────────────────────────────────
 # GLOBAL STATE
 # ─────────────────────────────────────────────
-_df: pd.DataFrame | None = None
-student_memory: dict[str, list[Any]] = {}
-
 _rag_index = None
 _rag_docs: list[str] = []
 _embedder  = None
 
 
 # ═══════════════════════════════════════════════════════════
-# DATA LOADING
+# DATA LOADING  (thin wrappers over db.py — kept for CLI call sites)
 # ═══════════════════════════════════════════════════════════
-def load_dataset() -> pd.DataFrame:
-    global _df
-    if _df is None:
-        if not Path(CSV_FILE).exists():
-            raise FileNotFoundError(
-                f"Dataset '{CSV_FILE}' not found. Run:  python generate_data.py"
-            )
-        _df = pd.read_csv(CSV_FILE)
-    return _df
+def load_dataset() -> list[int]:
+    """Returns all student IDs. Kept for CLI compatibility (teacher_overview)."""
+    return db.get_all_student_ids()
 
 
 # ═══════════════════════════════════════════════════════════
-# STUDENT CRUD
+# STUDENT CRUD  (Supabase-backed via db.py)
 # ═══════════════════════════════════════════════════════════
 
 def list_students() -> list[dict]:
     """Return a lightweight list of all students (id, name, year, branch, archetype)."""
-    df = load_dataset()
-    meta_cols = ["student_id", "name", "year", "branch", "archetype"]
-    available = [c for c in meta_cols if c in df.columns]
-    return (
-        df[available]
-        .drop_duplicates(subset=["student_id"])
-        .sort_values("student_id")
-        .to_dict(orient="records")
-    )
+    return db.list_students()
 
 
 def add_student(student_data: dict) -> dict:
     """
-    Add a new student to the CSV dataset.
+    Add a new student to Supabase.
 
     Expected keys in student_data
     ──────────────────────────────
@@ -129,63 +110,15 @@ def add_student(student_data: dict) -> dict:
 
     Returns the freshly built profile dict for the new student.
     """
-    global _df
-    df = load_dataset()
-
-    # Auto-assign next available student_id
-    new_id = int(df["student_id"].max()) + 1 if not df.empty else 1
-
-    topic_map = {t["topic"]: t for t in student_data.get("topics", []) if "topic" in t}
-
-    rows: list[dict] = []
-    for topic in COURSE_TOPICS:
-        td = topic_map.get(topic, {})
-        rows.append({
-            "student_id":  new_id,
-            "name":        student_data.get("name", f"Student {new_id}"),
-            "year":        int(student_data.get("year", 1)),
-            "branch":      student_data.get("branch", "CSE"),
-            "archetype":   student_data.get("archetype", "unknown"),
-            "topic":       topic,
-            "score":       float(td.get("score",       0.50)),
-            "time_spent":  float(td.get("time_spent",  60.0)),
-            "attempts":    float(td.get("attempts",    2.0)),
-            "confidence":  float(td.get("confidence",  0.50)),
-            "engagement":  float(td.get("engagement",  0.50)),
-            "fatigue":     float(td.get("fatigue",     0.30)),
-        })
-
-    _df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
-    _df.to_csv(CSV_FILE, index=False)
-
+    new_id = db.add_student(student_data)
     profile = build_profile(new_id, force_rebuild=True)
     update_memory(new_id, profile)
-    save_memory()
     return profile
 
 
 def delete_student(student_id: int | str) -> bool:
-    """
-    Remove a student from the CSV and from in-memory history.
-
-    Returns True if the student was found and deleted, False if not found.
-    """
-    global _df
-    df  = load_dataset()
-    sid = int(student_id)
-
-    if sid not in df["student_id"].values:
-        return False
-
-    _df = df[df["student_id"] != sid].reset_index(drop=True)
-    _df.to_csv(CSV_FILE, index=False)
-
-    str_sid = str(student_id)
-    with memory_lock:
-        if str_sid in student_memory:
-            student_memory.pop(str_sid, None)
-    save_memory()
-    return True
+    """Remove a student and their history. Returns True if found and deleted."""
+    return db.delete_student(int(student_id))
 
 
 def update_student(student_id: int | str, updates: dict) -> dict:
@@ -202,86 +135,44 @@ def update_student(student_id: int | str, updates: dict) -> dict:
     Returns the rebuilt profile dict after saving.
     Raises ValueError if the student does not exist.
     """
-    global _df
-    load_dataset()              # ensures _df is populated
-    assert _df is not None, "Dataset failed to load"
-    df: pd.DataFrame = _df          # local non-None reference for type checker
     sid = int(student_id)
-
-    if sid not in df["student_id"].values:  # type: ignore[index]
+    if not db.student_exists(sid):
         raise ValueError(f"Student ID {sid} not found in dataset.")
 
-    base_mask = df["student_id"] == sid  # type: ignore[index]
+    db.update_student_meta(sid, updates)
 
-    # ── metadata fields ──────────────────────────────────────
-    for field in ("name", "year", "branch", "archetype"):
-        if field in updates:
-            df.loc[base_mask, field] = updates[field]  # type: ignore[index]
-
-    # ── per-topic fields ─────────────────────────────────────
-    numeric_fields = ("score", "time_spent", "attempts", "confidence", "engagement", "fatigue")
     for topic_upd in updates.get("topics", []):
         topic = topic_upd.get("topic")
         if not topic:
             continue
-        topic_mask = base_mask & (df["topic"] == topic)  # type: ignore[index]
-        if not topic_mask.any():
+        if topic not in COURSE_TOPICS:
             warnings.warn(f"Topic '{topic}' not found for student {sid}; skipping.")
             continue
-        for field in numeric_fields:
-            if field in topic_upd:
-                df.loc[topic_mask, field] = float(topic_upd[field])  # type: ignore[index]
-
-    _df = df
-    _df.to_csv(CSV_FILE, index=False)
-
-    # Invalidate cached profile so next call rebuilds from fresh CSV data
-    str_sid = str(student_id)
-    with memory_lock:
-        if str_sid in student_memory:
-            student_memory[str_sid] = []
+        db.update_student_topic(sid, topic, topic_upd)
 
     profile = build_profile(sid, force_rebuild=True)
     update_memory(sid, profile)
-    save_memory()
     return profile
 
 
 # ═══════════════════════════════════════════════════════════
-# MEMORY
+# MEMORY  (append-only profile snapshots in the student_memory table)
 # ═══════════════════════════════════════════════════════════
-memory_lock = threading.Lock()
 
 def load_memory() -> None:
-    global student_memory
-    with memory_lock:
-        try:
-            with open(MEMORY_FILE, "r") as f:
-                student_memory = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
-            warnings.warn(f"Could not load memory: {exc}")
-            student_memory = {}
-        except Exception as exc:
-            warnings.warn(f"Could not load memory: {exc}")
-            student_memory = {}
+    """No-op — profiles are read from Supabase on demand. Kept for call-site compatibility."""
+    return None
 
 
 def save_memory() -> None:
-    with memory_lock:
-        tmp_file = MEMORY_FILE + ".tmp"
-        with open(tmp_file, "w") as f:
-            json.dump(dict(student_memory), f, indent=2)
-        os.replace(tmp_file, MEMORY_FILE)
+    """No-op — update_memory() persists immediately. Kept for call-site compatibility."""
+    return None
 
 
 def update_memory(student_id: int | str, profile: dict) -> None:
-    sid = str(student_id)
-    with memory_lock:
-        if sid not in student_memory:
-            student_memory[sid] = []
-        copy_prof = json.loads(json.dumps(profile))
-        copy_prof["timestamp"] = time.time()
-        student_memory[sid].append(copy_prof)
+    copy_prof = json.loads(json.dumps(profile))
+    copy_prof["timestamp"] = time.time()
+    db.append_profile(int(student_id), copy_prof)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -306,16 +197,19 @@ def build_profile(student_id: int | str, force_rebuild: bool = False) -> dict:
     Returns latest cached profile unless force_rebuild=True.
     """
     sid = str(student_id)
-    df  = load_dataset()
 
-    if not force_rebuild and sid in student_memory and student_memory[sid]:
-        return student_memory[sid][-1]
+    if not force_rebuild:
+        cached = db.get_latest_profile(int(sid))
+        if cached:
+            return cached
 
-    student_df = df[df["student_id"] == int(sid)]
-    if student_df.empty:
+    meta = db.get_student_meta(int(sid))
+    if meta is None:
         raise ValueError(f"Student ID {sid} not found in dataset.")
 
-    meta = student_df.iloc[0]
+    topics = db.get_student_topics(int(sid))
+    if not topics:
+        raise ValueError(f"Student ID {sid} has no topic data.")
 
     profile: dict[str, Any] = {
         "student_id":    sid,
@@ -331,8 +225,7 @@ def build_profile(student_id: int | str, force_rebuild: bool = False) -> dict:
         "summary":       "",
     }
 
-    for _, row in student_df.iterrows():
-        topic = row["topic"]
+    for topic, row in topics.items():
         score = _clean(row["score"])
         profile["knowledge"][topic] = score
         if score < WEAK_THRESHOLD:
@@ -340,12 +233,13 @@ def build_profile(student_id: int | str, force_rebuild: bool = False) -> dict:
         elif score >= TARGET_SCORE:
             profile["strong_topics"].append(topic)
 
+    rows = list(topics.values())
     profile["behavior"] = {
-        "avg_time":       _clean(student_df["time_spent"].mean()),
-        "avg_attempts":   _clean(student_df["attempts"].mean()),
-        "avg_confidence": _clean(student_df["confidence"].mean()),
-        "engagement":     _clean(student_df["engagement"].mean()),
-        "fatigue":        _clean(student_df["fatigue"].mean()),
+        "avg_time":       _clean(float(np.mean([r["time_spent"] for r in rows]))),
+        "avg_attempts":   _clean(float(np.mean([r["attempts"]   for r in rows]))),
+        "avg_confidence": _clean(float(np.mean([r["confidence"] for r in rows]))),
+        "engagement":     _clean(float(np.mean([r["engagement"] for r in rows]))),
+        "fatigue":        _clean(float(np.mean([r["fatigue"]    for r in rows]))),
     }
 
     profile = _add_psychology(profile)
@@ -677,7 +571,7 @@ def retrieve_relevant_material(query: str, top_k: int = 2) -> str:
 # ═══════════════════════════════════════════════════════════
 def plot_subject_progress(student_id: int | str, save_path: str | None = None) -> None:
     sid     = str(student_id)
-    history = student_memory.get(sid, [])
+    history = db.get_profile_history(int(sid))
     if not history:
         print("  No history yet.")
         return
@@ -729,16 +623,16 @@ def plot_radar(profile: dict, save_path: str | None = None) -> None:
 # CLASS-WIDE TEACHER OVERVIEW
 # ═══════════════════════════════════════════════════════════
 def teacher_overview(num_students: int | None = None) -> None:
-    df = load_dataset()
+    all_ids = load_dataset()
     if num_students is None:
-        num_students = int(df["student_id"].nunique())
+        num_students = len(all_ids)
 
     print(f"\n{_sep('═')}")
     print("  EDUTWIN — TEACHER OVERVIEW")
     print(_sep('═'))
 
     profiles = []
-    for sid in range(1, num_students + 1):
+    for sid in all_ids[:num_students]:
         try:
             profiles.append(build_profile(sid, force_rebuild=True))
         except Exception:
