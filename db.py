@@ -59,11 +59,11 @@ def get_client() -> Client:
 # ═══════════════════════════════════════════════════════════
 
 def list_students() -> list[dict]:
-    """Lightweight list of all students (id, name, year, branch, archetype)."""
+    """Lightweight list of all students (id, name, year, branch, archetype, avatar_id)."""
     res = (
         get_client()
         .table("students")
-        .select("id, name, year, branch, archetype")
+        .select("id, name, year, branch, archetype, avatar_id")
         .order("id")
         .execute()
     )
@@ -74,6 +74,7 @@ def list_students() -> list[dict]:
             "year": row["year"],
             "branch": row["branch"],
             "archetype": row["archetype"],
+            "avatar_id": row.get("avatar_id", "rogue"),
         }
         for row in res.data
     ]
@@ -88,7 +89,7 @@ def get_student_meta(student_id: int) -> dict | None:
     res = (
         get_client()
         .table("students")
-        .select("id, name, year, branch, archetype")
+        .select("id, name, year, branch, archetype, avatar_id, auth_user_id")
         .eq("id", student_id)
         .limit(1)
         .execute()
@@ -119,6 +120,7 @@ def add_student(student_data: dict) -> int:
         "year": int(student_data.get("year", 1)),
         "branch": student_data.get("branch", "CSE"),
         "archetype": student_data.get("archetype", "unknown"),
+        "avatar_id": student_data.get("avatar_id", "rogue"),
     }
     inserted = client.table("students").insert(meta).execute()
     new_id = inserted.data[0]["id"]
@@ -137,7 +139,10 @@ def add_student(student_data: dict) -> int:
 
 
 def update_student_meta(student_id: int, updates: dict) -> None:
-    fields = {k: v for k, v in updates.items() if k in ("name", "year", "branch", "archetype")}
+    fields = {
+        k: v for k, v in updates.items()
+        if k in ("name", "year", "branch", "archetype", "avatar_id")
+    }
     if fields:
         get_client().table("students").update(fields).eq("id", student_id).execute()
 
@@ -198,6 +203,40 @@ def get_profile_history(student_id: int) -> list[dict]:
 def invalidate_cache(student_id: int) -> None:
     """No-op placeholder kept for call-site compatibility — memory is append-only."""
     return None
+
+
+# ═══════════════════════════════════════════════════════════
+# QUIZ ATTEMPTS (the objective signal — see digital_twin.py)
+# ═══════════════════════════════════════════════════════════
+
+def record_quiz_attempt(
+    student_id: int, topic: str, question: str, answer: str,
+    correctness: float, feedback: str,
+) -> None:
+    get_client().table("quiz_attempts").insert({
+        "student_id": student_id,
+        "topic": topic,
+        "question": question,
+        "answer": answer,
+        "correctness": correctness,
+        "feedback": feedback,
+    }).execute()
+
+
+def get_quiz_stats(student_id: int) -> dict:
+    """Returns {count, avg_correctness} across all of this student's graded quizzes."""
+    res = (
+        get_client()
+        .table("quiz_attempts")
+        .select("correctness")
+        .eq("student_id", student_id)
+        .execute()
+    )
+    values = [row["correctness"] for row in res.data]
+    return {
+        "count": len(values),
+        "avg_correctness": (sum(values) / len(values)) if values else None,
+    }
 
 
 # ═══════════════════════════════════════════════════════════

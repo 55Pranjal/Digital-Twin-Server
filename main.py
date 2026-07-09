@@ -32,6 +32,7 @@ import db
 from digital_twin import (
     COURSE_TOPICS,
     INTERVENTION_EFFECTS,
+    QUIZ_ALPHA,
     add_student,
     build_profile,
     check_goal,
@@ -39,7 +40,9 @@ from digital_twin import (
     delete_student,
     diagnose_weaknesses_with_llm,
     generate_personalized_explanation,
+    generate_quiz_question,
     generate_study_plan,
+    grade_quiz_answer,
     list_students,
     load_dataset,
     load_memory,
@@ -170,6 +173,7 @@ class AddStudentBody(BaseModel):
     year: int = 1
     branch: str = "CSE"
     archetype: str = "unknown"
+    avatar_id: str = "rogue"
     topics: List[TopicInput] = []
 
 class TopicUpdate(BaseModel):
@@ -186,6 +190,7 @@ class UpdateStudentBody(BaseModel):
     year: Optional[int] = None
     branch: Optional[str] = None
     archetype: Optional[str] = None
+    avatar_id: Optional[str] = None
     topics: Optional[List[TopicUpdate]] = None
 
 
@@ -196,6 +201,13 @@ class RegisterTeacherBody(BaseModel):
 
 class ClaimStudentBody(BaseModel):
     student_id: int
+
+
+# ── Quiz models ───────────────────────────────────────────────
+
+class QuizAnswerBody(BaseModel):
+    question: str
+    answer: str
 
 
 # ═══════════════════════════════════════════════════════════
@@ -576,6 +588,81 @@ def get_recommendations(
 
 
 # ═══════════════════════════════════════════════════════════
+# ENDPOINT 10a — QUIZ QUESTION
+# GET /api/v1/quiz/{student_id}/{topic}/question
+# ═══════════════════════════════════════════════════════════
+# The objective signal that corrects self-reported topic scores. The
+# question is deliberately NOT personalised to the student's profile —
+# it needs to be a fair, independent check, not something shaped by (and
+# so reinforcing) whatever the student already claimed about themselves.
+
+@app.get("/api/v1/quiz/{student_id}/{topic}/question")
+def get_quiz_question(
+    student_id: int,
+    topic: str,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
+    if topic not in VALID_TOPICS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid topic '{topic}'. Must be one of: {VALID_TOPICS}",
+        )
+    question = generate_quiz_question(topic)
+    return {"student_id": str(student_id), "topic": topic, "question": question}
+
+
+# ═══════════════════════════════════════════════════════════
+# ENDPOINT 10b — GRADE QUIZ ANSWER
+# POST /api/v1/quiz/{student_id}/{topic}/grade
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/api/v1/quiz/{student_id}/{topic}/grade")
+def grade_quiz(
+    student_id: int,
+    topic: str,
+    body: QuizAnswerBody,
+    user: auth.CurrentUser = Depends(require_self_or_teacher),
+):
+    """
+    LLM-grades the student's answer, then folds the result into
+    student_topics.score via a rolling average (QUIZ_ALPHA weight) — this
+    is what actually corrects a self-reported score toward reality, rather
+    than trusting whatever was entered at sign-up.
+    """
+    if topic not in VALID_TOPICS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid topic '{topic}'. Must be one of: {VALID_TOPICS}",
+        )
+    profile   = _get_profile_or_404(student_id)
+    old_score = profile["knowledge"].get(topic, 0.5)
+
+    grade     = grade_quiz_answer(topic, body.question, body.answer)
+    new_score = round(
+        max(0.0, min(1.0, old_score * (1 - QUIZ_ALPHA) + grade["correctness"] * QUIZ_ALPHA)), 4
+    )
+
+    db.update_student_topic(student_id, topic, {"score": new_score})
+    db.record_quiz_attempt(
+        student_id, topic, body.question, body.answer,
+        grade["correctness"], grade["feedback"],
+    )
+
+    updated_profile = build_profile(student_id, force_rebuild=True)
+    update_memory(student_id, updated_profile)
+
+    return {
+        "student_id":      str(student_id),
+        "topic":           topic,
+        "correctness":     grade["correctness"],
+        "feedback":        grade["feedback"],
+        "old_score_pct":   round(old_score * 100, 1),
+        "new_score_pct":   round(new_score * 100, 1),
+        "updated_profile": updated_profile,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # ENDPOINT 11 — TEACHER OVERVIEW
 # GET /api/v1/teacher
 # ═══════════════════════════════════════════════════════════
@@ -618,6 +705,7 @@ def teacher_overview(
                 "avg_score_pct": round(perf * 100, 1),
                 "risk":          risk["risk"],
                 "risk_score":    risk["score"],
+                "risk_basis":    risk["basis"],
                 "weak_topics":   p["weak_topics"],
             }
             for p, perf, risk in zip(profiles, perf_list, risk_list)

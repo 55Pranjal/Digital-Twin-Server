@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import warnings
 from pathlib import Path
@@ -67,6 +68,11 @@ INTERVENTION_EFFECTS = {
 }
 
 TOPIC_DIFFICULTY = {"ai_ml": 0.5, "probability": 0.7, "linear_algebra": 0.8}
+
+# Rolling-average weight given to a freshly graded quiz result when it's
+# folded into a topic's knowledge score. Deliberately not 1.0 — one quiz
+# shouldn't overwrite the running estimate, it should nudge it.
+QUIZ_ALPHA = 0.30
 
 # ─────────────────────────────────────────────
 # GLOBAL STATE
@@ -217,6 +223,7 @@ def build_profile(student_id: int | str, force_rebuild: bool = False) -> dict:
         "year":          int(meta.get("year",   1)),
         "branch":        meta.get("branch",    "CSE"),
         "archetype":     meta.get("archetype", "unknown"),
+        "avatar_id":     meta.get("avatar_id", "rogue"),
         "knowledge":     {},
         "weak_topics":   [],
         "strong_topics": [],
@@ -234,13 +241,27 @@ def build_profile(student_id: int | str, force_rebuild: bool = False) -> dict:
             profile["strong_topics"].append(topic)
 
     rows = list(topics.values())
+    avg_confidence = _clean(float(np.mean([r["confidence"] for r in rows])))
     profile["behavior"] = {
         "avg_time":       _clean(float(np.mean([r["time_spent"] for r in rows]))),
         "avg_attempts":   _clean(float(np.mean([r["attempts"]   for r in rows]))),
-        "avg_confidence": _clean(float(np.mean([r["confidence"] for r in rows]))),
+        "avg_confidence": avg_confidence,
         "engagement":     _clean(float(np.mean([r["engagement"] for r in rows]))),
         "fatigue":        _clean(float(np.mean([r["fatigue"]    for r in rows]))),
     }
+
+    # Objective signal — how this student has actually done on graded quizzes,
+    # vs. avg_confidence above which is purely self-reported. Once quizzes
+    # exist, predict_struggle() below trusts this over raw self-report.
+    quiz_stats = db.get_quiz_stats(int(sid))
+    profile["behavior"]["quiz_count"] = quiz_stats["count"]
+    profile["behavior"]["avg_quiz_correctness"] = (
+        _clean(quiz_stats["avg_correctness"]) if quiz_stats["avg_correctness"] is not None else None
+    )
+    profile["behavior"]["calibration_gap"] = (
+        _clean(avg_confidence - quiz_stats["avg_correctness"])
+        if quiz_stats["avg_correctness"] is not None else None
+    )
 
     profile = _add_psychology(profile)
     profile["summary"] = generate_llp_summary(profile)
@@ -302,10 +323,32 @@ def check_goal(profile: dict) -> bool:
 # RISK PREDICTION
 # ═══════════════════════════════════════════════════════════
 def predict_struggle(profile: dict) -> dict:
+    """
+    Risk score in [0, 1], higher = more at-risk.
+
+    Once a student has at least one graded quiz, demonstrated correctness
+    (objective) dominates the score instead of self-reported confidence —
+    self-report only enters as an "overconfidence penalty" when it
+    significantly overstates actual performance. Before any quiz exists
+    there's no objective signal yet, so self-reported confidence is used
+    as the best available proxy — `basis` in the return value makes that
+    distinction visible to callers instead of hiding it.
+    """
     weak_ratio = len(profile["weak_topics"]) / max(len(profile["knowledge"]), 1)
-    low_conf   = 1 - profile["behavior"]["avg_confidence"]
     fatigue    = profile["behavior"]["fatigue"]
-    score      = 0.40 * weak_ratio + 0.30 * low_conf + 0.30 * fatigue
+    quiz_count = profile["behavior"].get("quiz_count", 0)
+
+    if quiz_count > 0:
+        avg_correct   = profile["behavior"]["avg_quiz_correctness"]
+        calib_gap     = profile["behavior"]["calibration_gap"]  # confidence - correctness
+        objective_risk = 1 - avg_correct
+        overconfidence = max(0.0, calib_gap)  # only penalise overclaiming, not underclaiming
+        score  = 0.45 * weak_ratio + 0.35 * objective_risk + 0.10 * overconfidence + 0.10 * fatigue
+        basis  = "verified"
+    else:
+        low_conf = 1 - profile["behavior"]["avg_confidence"]
+        score    = 0.40 * weak_ratio + 0.30 * low_conf + 0.30 * fatigue
+        basis    = "self_reported"
 
     if score > 0.60:
         risk = "High Risk"
@@ -314,7 +357,7 @@ def predict_struggle(profile: dict) -> dict:
     else:
         risk = "Low Risk"
 
-    return {"risk": risk, "score": round(score, 4)}  # type: ignore[arg-type]
+    return {"risk": risk, "score": round(score, 4), "basis": basis}  # type: ignore[arg-type]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -482,6 +525,58 @@ def generate_study_plan(profile: dict, days: int = 7) -> str:
         "Keep it realistic and specific."
     )
     return call_llm(prompt, system)
+
+
+# ═══════════════════════════════════════════════════════════
+# QUIZ — the objective signal that corrects self-reported scores
+# ═══════════════════════════════════════════════════════════
+def generate_quiz_question(topic: str) -> str:
+    """
+    Generates ONE short-answer question for a topic — deliberately not
+    personalized to the student's profile, so it's a fair, objective check
+    rather than something shaped by (and thus reinforcing) self-reported data.
+    """
+    context = COURSE_MATERIAL.get(topic, "")
+    system = (
+        "You are a university exam question writer. Write ONE clear, "
+        "self-contained question that fairly tests understanding of the "
+        "given topic. Do not include the answer."
+    )
+    prompt = (
+        f"Topic: {topic}\nContext: {context}\n\n"
+        "Write one short-answer or conceptual exam question testing this "
+        "topic (not multiple choice). Output ONLY the question text."
+    )
+    return call_llm(prompt, system).strip()
+
+
+def grade_quiz_answer(topic: str, question: str, answer: str) -> dict:
+    """Returns {"correctness": float 0-1, "feedback": str}."""
+    context = COURSE_MATERIAL.get(topic, "")
+    system = (
+        "You are a strict but fair university exam grader. Grade the "
+        "student's answer for correctness and completeness against the "
+        "topic, not writing quality."
+    )
+    prompt = (
+        f"Topic: {topic}\nContext: {context}\n\n"
+        f"Question: {question}\n\n"
+        f"Student's answer: {answer}\n\n"
+        "Grade this answer's correctness from 0.0 (completely wrong or "
+        "blank) to 1.0 (fully correct and complete). Respond in EXACTLY "
+        "this format:\n"
+        "SCORE: <number between 0.0 and 1.0>\n"
+        "FEEDBACK: <one or two sentence explanation of what was right/wrong>"
+    )
+    return _parse_quiz_grade(call_llm(prompt, system))
+
+
+def _parse_quiz_grade(raw: str) -> dict:
+    score_match    = re.search(r"SCORE:\s*([0-9]*\.?[0-9]+)", raw)
+    feedback_match = re.search(r"FEEDBACK:\s*(.+)", raw, re.DOTALL)
+    correctness = _clamp(float(score_match.group(1))) if score_match else 0.5
+    feedback    = feedback_match.group(1).strip() if feedback_match else raw.strip()
+    return {"correctness": correctness, "feedback": feedback}
 
 
 # ═══════════════════════════════════════════════════════════

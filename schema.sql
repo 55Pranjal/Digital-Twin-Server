@@ -15,6 +15,7 @@ create table if not exists public.students (
   year         int not null default 1,
   branch       text not null default 'CSE',
   archetype    text not null default 'unknown',
+  avatar_id    text not null default 'rogue',
   auth_user_id uuid references auth.users(id) on delete set null,
   created_at   timestamptz not null default now()
 );
@@ -51,6 +52,24 @@ create table if not exists public.student_memory (
 create index if not exists student_memory_student_id_created_at_idx
   on public.student_memory (student_id, created_at desc);
 
+-- ── quiz_attempts ─────────────────────────────────────────
+-- One row per graded quiz question. This is the objective signal that
+-- actually moves student_topics.score — self-reported sliders only ever
+-- set the initial prior; real quiz correctness is what corrects it.
+create table if not exists public.quiz_attempts (
+  id          bigint generated always as identity primary key,
+  student_id  bigint not null references public.students(id) on delete cascade,
+  topic       text not null,
+  question    text not null,
+  answer      text not null,
+  correctness double precision not null, -- 0..1, LLM-graded
+  feedback    text,
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists quiz_attempts_student_id_created_at_idx
+  on public.quiz_attempts (student_id, created_at desc);
+
 -- ── user_profiles ─────────────────────────────────────────
 -- Links a Supabase Auth user to an app role and (for students) their student row.
 create table if not exists public.user_profiles (
@@ -71,6 +90,7 @@ create table if not exists public.user_profiles (
 alter table public.students        enable row level security;
 alter table public.student_topics  enable row level security;
 alter table public.student_memory  enable row level security;
+alter table public.quiz_attempts   enable row level security;
 alter table public.user_profiles   enable row level security;
 
 -- No policies are created — default-deny for anon/authenticated roles.
